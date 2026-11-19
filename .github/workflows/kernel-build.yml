@@ -1,0 +1,103 @@
+name: Build kernel packages
+
+on:
+  schedule:
+    - cron: "30 1 * * *" # daily, 01:30 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Never run two checks at once: both would see the same version as unbuilt.
+concurrency:
+  group: kernel-build
+  cancel-in-progress: false
+
+env:
+  GH_REPO: ${{ github.repository }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: yesong-lab
+    container:
+      image: debian:trixie
+    outputs:
+      matrix: ${{ steps.check.outputs.matrix }}
+      count: ${{ steps.check.outputs.count }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install tools
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl gh jq
+
+      - name: Find unbuilt releases
+        id: check
+        run: |
+          pending=$(bash scripts/check-releases.sh)
+          jq . <<<"$pending"
+          echo "matrix=$(jq -c '{include: .}' <<<"$pending")" >>"$GITHUB_OUTPUT"
+          echo "count=$(jq length <<<"$pending")" >>"$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.count != '0'
+    name: ${{ matrix.version }} (${{ matrix.moniker }})
+    runs-on: yesong-lab
+    container:
+      image: debian:trixie
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.check.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        run: bash scripts/install-build-deps.sh
+
+      - name: Build .deb and .rpm
+        run: bash scripts/build-kernel.sh "${{ matrix.version }}" "${{ matrix.source }}" out
+
+      - name: Publish release
+        env:
+          VERSION: ${{ matrix.version }}
+          MONIKER: ${{ matrix.moniker }}
+          SOURCE: ${{ matrix.source }}
+          TAG: ${{ matrix.tag }}
+          PRERELEASE: ${{ matrix.prerelease }}
+          LATEST: ${{ matrix.latest }}
+        run: |
+          # gh uploads into a draft and publishes at the end; drop drafts left
+          # by earlier interrupted runs of this tag.
+          gh api --paginate "repos/$GH_REPO/releases" \
+            --jq ".[] | select(.draft and .tag_name == \"$TAG\") | .id" |
+            while read -r id; do gh api -X DELETE "repos/$GH_REPO/releases/$id"; done
+
+          {
+            echo "Linux $VERSION ($MONIKER), built from $SOURCE"
+            echo
+            echo "Config: Fedora rawhide kernel-x86_64-fedora.config + \`configs/fragment.config\` (attached as \`config-*\`)."
+            echo
+            echo '```'
+            cat out/SHA256SUMS
+            echo '```'
+          } >notes.md
+
+          flags=(--latest="$LATEST")
+          if [[ $PRERELEASE == true ]]; then flags+=(--prerelease); fi
+          gh release create "$TAG" out/* \
+            --target "$GITHUB_SHA" \
+            --title "Linux $VERSION ($MONIKER)" \
+            --notes-file notes.md \
+            "${flags[@]}"
+
+      - name: Clean up
+        if: always()
+        run: rm -rf out notes.md "$RUNNER_TEMP/kernel-build"
